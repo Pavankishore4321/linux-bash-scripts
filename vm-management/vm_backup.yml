@@ -1,0 +1,106 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Ansible Playbook: KVM Virtual Machine Backup
+# Project:  On-Premises Server Maintenance (Incresol Software Services)
+# Purpose:  Gracefully shut down KVM VMs, take qcow2 disk backup, restart VMs
+# Usage:    ansible-playbook vm_backup.yml
+# Schedule: Run via cron — typically weekly or nightly
+# ─────────────────────────────────────────────────────────────────────────────
+
+- hosts: localhost
+  become: yes
+
+  vars:
+    backup_base_dir: "/backupvm3"
+    kvm_base_dir: "/kvm/vms2"
+    shutdown_wait_seconds: 60
+    vms:
+      - name: "VM-SERVER-1"
+        disk_file: "VM-SERVER-1.qcow2"
+      - name: "VM-SERVER-2"
+        disk_file: "VM-SERVER-2.qcow2"
+      - name: "VM-SERVER-3"
+        disk_file: "VM-SERVER-3.qcow2"
+
+  tasks:
+
+    - name: Check backup base directory exists
+      stat:
+        path: "{{ backup_base_dir }}"
+      register: backup_dir_stat
+
+    - name: Fail if backup directory does not exist
+      fail:
+        msg: "Backup directory {{ backup_base_dir }} does not exist. Please create it first."
+      when: not backup_dir_stat.stat.exists
+
+    - name: Ensure individual VM backup directories exist
+      file:
+        path: "{{ backup_base_dir }}/{{ item.name }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ vms }}"
+
+    # ── PER-VM: SHUTDOWN → BACKUP → START ────────────────────────────────────
+    - name: Gracefully shut down VM
+      shell: "virsh shutdown {{ item.name }}"
+      delegate_to: localhost
+      loop: "{{ vms }}"
+      ignore_errors: yes
+
+    - name: Wait for VMs to fully shut down
+      pause:
+        seconds: "{{ shutdown_wait_seconds }}"
+
+    - name: Verify VM is shut off before backup
+      shell: "virsh domstate {{ item.name }}"
+      register: vm_state
+      loop: "{{ vms }}"
+      changed_when: false
+
+    - name: Copy qcow2 disk image to backup directory
+      shell: >
+        cp {{ kvm_base_dir }}/{{ item.name }}/{{ item.disk_file }}
+        {{ backup_base_dir }}/{{ item.name }}/{{ item.disk_file }}
+      loop: "{{ vms }}"
+
+    - name: Start VM after backup
+      shell: "virsh start {{ item.name }}"
+      delegate_to: localhost
+      loop: "{{ vms }}"
+
+    - name: Wait for VMs to boot up
+      pause:
+        seconds: 30
+
+    - name: Verify VM is running after backup
+      shell: "virsh domstate {{ item.name }}"
+      register: vm_state_after
+      loop: "{{ vms }}"
+      changed_when: false
+
+    # ── LOGGING ───────────────────────────────────────────────────────────────
+    - name: Ensure log file exists for each VM
+      file:
+        path: "{{ backup_base_dir }}/{{ item.name }}/backup.log"
+        state: touch
+        mode: '0644'
+      loop: "{{ vms }}"
+
+    - name: Write backup completion log entry
+      shell: >
+        echo "Backup completed for {{ item.name }} on $(date '+%Y-%m-%d %H:%M:%S')
+        | Status: $(virsh domstate {{ item.name }})"
+        >> {{ backup_base_dir }}/{{ item.name }}/backup.log
+      loop: "{{ vms }}"
+
+    - name: Show backup log summary
+      shell: "tail -5 {{ backup_base_dir }}/{{ item.name }}/backup.log"
+      register: log_output
+      loop: "{{ vms }}"
+      changed_when: false
+
+    - name: Print log output
+      debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ log_output.results }}"
